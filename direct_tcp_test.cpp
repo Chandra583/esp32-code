@@ -16,7 +16,7 @@ void setup() {
   
   Serial.println("\n=== ESP32 Direct TCP Test ===");
   
-  // Connect to WiFi
+  // Connect to   pWiFi
   Serial.println("Connecting to WiFi...");
   WiFi.begin(ssid, password);
   
