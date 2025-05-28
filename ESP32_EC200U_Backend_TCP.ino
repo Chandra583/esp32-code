@@ -108,6 +108,13 @@ struct VehicleData {
   String odometerPID;
 };
 
+// Structure to hold discovered PID values during scan
+struct DiscoveredValue {
+  String pid;
+  float value;
+  String rawResponse;
+};
+
 // Network information structure
 struct NetworkInfo {
   String operatorName;
@@ -317,6 +324,176 @@ bool initializeELM327Manual(WiFiClient &client, const String &host, int port) {
   return true;
 }
 
+// Function to fetch the Vehicle Identification Number (VIN)
+String fetchVIN(WiFiClient &client) {
+  logMessage(LOG_INFO, "Requesting VIN (Mode 09 PID 02)...");
+  
+  // Send a simple command first to ensure active communication
+  client.println("0100"); 
+  delay(200); // Short delay after test command
+  // Clear any response from 0100 before sending 0902
+  unsigned long clearStart = millis();
+  while(client.available() && (millis() - clearStart < 1000)) {
+    client.read();
+  }
+
+  client.println("0902");
+
+  String rawResponse = "";
+  String vin = "";
+  unsigned long startTime = millis();
+  bool endOfMessage = false;
+  int linesProcessed = 0;
+
+  // Wait for response, typically multi-line, ends with '>' or timeout
+  while (millis() - startTime < 7000 && !endOfMessage) { // Increased timeout to 7 seconds
+    if (client.available()) {
+      char c = client.read();
+      rawResponse += c;
+      if (c == '>') {
+        endOfMessage = true;
+      }
+    } else {
+      yield(); // Allow other tasks to run, important for network stability
+    }
+  }
+
+  logMessage(LOG_DEBUG, "Raw VIN response: " + rawResponse);
+
+  // Process the raw response to extract VIN
+  // Expected format: Lines starting with "49 02 0X" (X is sequence number)
+  // followed by ASCII hex codes for VIN characters.
+  // Example: 49 02 01 31 4B 34 ... (first line of VIN)
+  //          49 02 02 4D 4A 31 ... (second line)
+
+  // Clean up the raw response a bit
+  rawResponse.replace("\r", "\n"); // Normalize line endings
+  rawResponse.replace(" ", "");    // Remove all spaces to simplify parsing hex pairs
+
+  int currentPos = 0;
+  while (currentPos < rawResponse.length()) {
+    int nlPos = rawResponse.indexOf('\n', currentPos);
+    if (nlPos == -1) nlPos = rawResponse.length();
+    
+    String line = rawResponse.substring(currentPos, nlPos);
+    currentPos = nlPos + 1;
+
+    // Look for lines that contain the VIN data (e.g., starting with 490201, 490202, etc.)
+    // The actual VIN characters start after this header.
+    // 490201 (7 chars), 490202 (7 chars), etc. or 4902 (ISO 15765-4 frame contains 4902 and then VIN bytes)
+    // A common response for VIN from ELM327 might be like:
+    // 7E8 0A 49 02 01 56 49 4E... (CAN response, data starts after 01)
+    // Or directly: 49020156494E...
+
+    String dataPrefix = "";
+    if (line.startsWith("490201")) dataPrefix = "490201";
+    else if (line.startsWith("490202")) dataPrefix = "490202";
+    else if (line.startsWith("490203")) dataPrefix = "490203";
+    // Add more if VIN is longer than 3 lines, though unlikely for standard 17-char VIN
+    // Also, sometimes the response is on one line: 011
+    // NO DATA
+    // 4902014D48354B4D344B
+    // 49020239373831303735
+    // 490203333231
+
+    // A more direct approach for ELM327: It often strips headers and gives only the data bytes.
+    // Or it can come within a CAN frame like 7Ex (e.g. 7E8, 7E9, 7EA)
+    // 7E8 10 14 49 02 01 31 47 31 
+    // 4A 46 36 45 35 34 4B 4D 
+    // 32 31 33 33 39 30
+
+    // Try to find "4902" and then look for the VIN characters
+    int vinHeaderPos = line.indexOf("4902");
+    if (vinHeaderPos != -1) {
+        String potentialVinData = line.substring(vinHeaderPos + 4); // Skip "4902"
+        // The next byte is often a sequence/frame indicator (e.g., 01, 02, 03, or part of a length byte)
+        // Let's assume it might be followed by the VIN bytes if sequence number is small (e.g. < 0A)
+        // For now, a simplified parser: just take hex pairs after "4902"
+        // If the line starts with 7Ex (CAN frame), data is further in.
+        // Example: 7E81014490201[VIN_PART_HEX]
+        int dataStartOffset = 0;
+        if (line.startsWith("7E")) { // Check if it's a CAN response frame
+            // Typical format: 7Ex LL DD 49 02 SQ [VIN_HEX ...]
+            // LL = Length (e.g., 10 14 for 20 bytes payload)
+            // DD = Data Bytes (e.g. 14)
+            // SQ = Sequence (e.g. 01)
+            // Find 4902 then skip one more byte for SQ before VIN hex data
+            int actualDataStartPos = line.indexOf("4902");
+            if (actualDataStartPos != -1 && actualDataStartPos + 4 + 2 <= line.length()) { // 4 for "4902", 2 for SQ byte
+                potentialVinData = line.substring(actualDataStartPos + 4 + 2);
+            } else {
+                potentialVinData = ""; // Not a valid CAN frame for VIN data
+            }
+        } else if (potentialVinData.length() > 2 && (potentialVinData.startsWith("01") || potentialVinData.startsWith("02") || potentialVinData.startsWith("03"))){
+            potentialVinData = potentialVinData.substring(2); // Skip sequence byte like 01, 02, 03
+        }
+
+        for (int i = 0; i < potentialVinData.length() - 1; i += 2) {
+            String hexPair = potentialVinData.substring(i, i + 2);
+            // Ensure it's a valid hex pair
+            if (isxdigit(hexPair.charAt(0)) && isxdigit(hexPair.charAt(1))) {
+                char chr = (char)strtol(hexPair.c_str(), NULL, 16);
+                // Filter out non-printable or control characters, VINs are typically alphanumeric
+                if (isGraph(chr) && vin.length() < 17) { // Standard VIN is 17 chars
+                    vin += chr;
+                }
+            }
+        }
+        linesProcessed++;
+    }
+  }
+
+  if (vin.length() > 0) {
+    logMessage(LOG_INFO, "Successfully fetched VIN: " + vin);
+  } else {
+    logMessage(LOG_WARN, "Failed to fetch or parse VIN. Raw: " + rawResponse);
+  }
+  return vin;
+}
+
+// Function to save all discovered PID scan results to a JSON file on SPIFFS
+bool saveFullScanResultsToSPIFFS(const DiscoveredValue allValues[], int count) {
+  if (count == 0) {
+    logMessage(LOG_INFO, "No scan results to save.");
+    return false;
+  }
+
+  if (!SPIFFS.begin(true)) {
+    logMessage(LOG_ERROR, "SPIFFS Mount Failed for saving scan results");
+    return false;
+  }
+
+  DynamicJsonDocument doc(ESP.getMaxAllocHeap() / 2); // Allocate a generous portion of heap for JSON, adjust if needed
+  JsonArray resultsArray = doc.to<JsonArray>();
+
+  for (int i = 0; i < count; i++) {
+    JsonObject pidResult = resultsArray.createNestedObject();
+    pidResult["pid"] = allValues[i].pid;
+    pidResult["rawValue"] = allValues[i].value; // This is the numeric value, could be 0 if not parsed
+    pidResult["rawResponseHex"] = allValues[i].rawResponse; // This is the full hex string
+  }
+
+  String filename = "/scanlog_" + String(millis()) + ".json";
+  File file = SPIFFS.open(filename, FILE_WRITE);
+  if (!file) {
+    logMessage(LOG_ERROR, "Failed to create scan log file: " + filename);
+    SPIFFS.end();
+    return false;
+  }
+
+  size_t bytesWritten = serializeJson(doc, file);
+  file.close();
+  SPIFFS.end();
+
+  if (bytesWritten > 0) {
+    logMessage(LOG_INFO, "Full scan results saved to: " + filename + " (" + String(bytesWritten) + " bytes)");
+    return true;
+  } else {
+    logMessage(LOG_ERROR, "Failed to write scan results to file: " + filename);
+    return false;
+  }
+}
+
 // Enhanced OBD data collection with manual initialization
 bool fetchEnhancedOBDData(VehicleData &data) {
   logMessage(LOG_INFO, "Starting enhanced OBD data collection");
@@ -327,6 +504,8 @@ bool fetchEnhancedOBDData(VehicleData &data) {
   data.batteryVoltage = getBatteryVoltage();
   data.dataQuality = 0;
   data.odometerPID = "N/A"; // Initialize odometerPID
+  
+  float dashboardValue = 64800; // Declare dashboardValue earlier for the log message
   
   // Test basic TCP connection first - use gateway IP from network info
   logMessage(LOG_INFO, "🔍 Testing TCP connection to OBD device...");
@@ -586,15 +765,9 @@ bool fetchEnhancedOBDData(VehicleData &data) {
   
   // EXHAUSTIVE PID SCANNER for Hyundai i20
   logMessage(LOG_INFO, "🔍 EXHAUSTIVE PID SCANNER - Testing 139+ PIDs...");
-  logMessage(LOG_INFO, "🎯 Target: Find odometer reading around 57,361 km");
+  logMessage(LOG_INFO, "🎯 Target: Find odometer reading around " + String(dashboardValue, 2) + " km");
   
   // Array to store all discovered values
-  struct DiscoveredValue {
-    String pid;
-    float value;
-    String rawResponse;
-  };
-  
   static DiscoveredValue allValues[200];
   int discoveredCount = 0;
   
@@ -771,86 +944,85 @@ bool fetchEnhancedOBDData(VehicleData &data) {
   logMessage(LOG_INFO, "Scanned " + String(totalPIDs) + " PIDs");
   logMessage(LOG_INFO, "Found " + String(discoveredCount) + " responses with data");
   
-  // Show all values in the 50,000-70,000 range
-  logMessage(LOG_INFO, "\n🎯 Values in odometer range (50k-70k):");
-  
-  float closestValue = 0;
-  String closestPID = "";
-  float minDiff = 999999;
-  float dashboardValue = 64800; // Set your dashboard value here for highlighting
-  
-  // Scaling factor for odometer correction (adjust as needed)
-  const float ODOMETER_SCALING_FACTOR = 1.13; // Adjust this factor to match your dashboard
-  
+  // dashboardValue is already declared earlier in the function now
+  logMessage(LOG_INFO, "\n🎯 Identifying Odometer PID: Comparing RAW PID values to dashboard target (" + String(dashboardValue, 2) + " km).");
+  logMessage(LOG_INFO, "   The reported mileage will be the RAW value from the selected PID.");
+
+  float bestRawOdometerValue = 0; 
+  String bestOdometerPID = "";
+  float smallestRawDiffToDashboard = 999999;  
+
   for (int i = 0; i < discoveredCount; i++) {
-    if (allValues[i].value >= 50000 && allValues[i].value <= 70000) {
-      float diff = abs(allValues[i].value - dashboardValue);
-      float scaledValue = allValues[i].value * ODOMETER_SCALING_FACTOR;
-      float scaledDiff = abs(scaledValue - dashboardValue);
-      String marker = "";
+    if (allValues[i].value > 0) { // Consider any PID that had a numeric value parsed
       
-      if (diff < 100) {
-        marker = " ⭐⭐⭐ RAW EXACT MATCH!";
-      } else if (diff < 1000) {
-        marker = " ⭐⭐ RAW VERY CLOSE!";
-      } else if (diff < 5000) {
-        marker = " ⭐ RAW CLOSE";
+      float currentRawPidValue = allValues[i].value;
+      float diffCurrentRawPidToDashboard = abs(currentRawPidValue - dashboardValue); 
+      
+      String logMarker = "";
+      if (diffCurrentRawPidToDashboard < smallestRawDiffToDashboard) {
+          logMarker = " (NEW BEST RAW CANDIDATE TO MATCH DASHBOARD TARGET)";
       }
-      if (scaledDiff < 100) {
-        marker += " [SCALED ⭐⭐⭐ MATCH]";
-      } else if (scaledDiff < 1000) {
-        marker += " [SCALED ⭐⭐ CLOSE]";
-      } else if (scaledDiff < 5000) {
-        marker += " [SCALED ⭐ CLOSE]";
-      }
+
+      // Log current PID's raw value and its difference from the dashboard target
+      logMessage(LOG_INFO, "PID " + allValues[i].pid + 
+                           ": RAW_VALUE=" + String(currentRawPidValue) + " km." +
+                           " Diff_from_target=" + String(diffCurrentRawPidToDashboard) + "km." + logMarker);
+      logMessage(LOG_INFO, "  Raw hex response: " + allValues[i].rawResponse); // Already logged during scan but good for context here
       
-      logMessage(LOG_INFO, "PID " + allValues[i].pid + ": RAW=" + String(allValues[i].value) + " km, SCALED=" + String(scaledValue) + " km (diff: " + String(diff) + ", scaled diff: " + String(scaledDiff) + ")" + marker);
-      logMessage(LOG_INFO, "  Raw hex response: " + allValues[i].rawResponse);
-      
-      // Special log for PID 0180
+      // Special log for PID 0180 if it's still relevant for any specific checks
       if (allValues[i].pid == "0180") {
-        logMessage(LOG_INFO, "  >>> PID 0180 Special: RAW=" + String(allValues[i].value) + ", SCALED=" + String(scaledValue) + ", Dashboard=" + String(dashboardValue));
-        logMessage(LOG_INFO, "  >>> 0180 Raw hex: " + allValues[i].rawResponse);
+        logMessage(LOG_INFO, "  >>> PID 0180 Special Check: RAW=" + String(allValues[i].value) + ", Target_Dashboard_Val=" + String(dashboardValue));
       }
       
-      if (scaledDiff < minDiff) {
-        minDiff = scaledDiff;
-        closestValue = scaledValue;
-        closestPID = allValues[i].pid;
+      // Update selection if this PID's raw value is closer to the dashboard target
+      if (diffCurrentRawPidToDashboard < smallestRawDiffToDashboard) {
+        smallestRawDiffToDashboard = diffCurrentRawPidToDashboard;
+        bestRawOdometerValue = currentRawPidValue; // Store the raw value itself
+        bestOdometerPID = allValues[i].pid;
       }
     }
   }
   
-  // Also show PIDs with raw data for manual inspection
-  logMessage(LOG_INFO, "\n📋 PIDs with substantial data (for manual inspection):");
-  for (int i = 0; i < discoveredCount && i < 20; i++) {
-    if (allValues[i].value == 0 && allValues[i].rawResponse.length() > 20) {
+  // Also show PIDs with substantial data (rawResponse) for manual inspection if their value was 0
+  // This helps to spot PIDs that returned data but not in a simple numeric format we parsed as allValues[i].value
+  logMessage(LOG_INFO, "\n📋 PIDs with other substantial data (for manual inspection if not chosen or value was 0):");
+  for (int i = 0; i < discoveredCount && i < 20; i++) { // Limit to avoid too much logging
+    if (allValues[i].value == 0 && allValues[i].rawResponse.length() > 10) { // Check for decent length non-numeric responses
       logMessage(LOG_INFO, "PID " + allValues[i].pid + ": " + allValues[i].rawResponse.substring(0, 40) + "...");
     }
   }
   
-  if (closestValue > 0) {
-    data.mileage = closestValue;
-    successCount++;
-    data.odometerPID = closestPID; // Store the found odometer PID
-    logMessage(LOG_INFO, "\n🎉 FOUND ODOMETER: " + String(closestValue) + " km from PID " + closestPID);
-    logMessage(LOG_INFO, "📏 Difference from 57361: " + String(minDiff) + " km");
+  if (bestOdometerPID != "") { // Check if a PID was selected
+    data.mileage = bestRawOdometerValue; // Assign the selected RAW value
+    successCount++; 
+    data.odometerPID = bestOdometerPID; 
+    logMessage(LOG_INFO, "\n🎉 FOUND ODOMETER: " + String(data.mileage) + " km (RAW value) from PID " + data.odometerPID);
+    logMessage(LOG_INFO, "   This PID's RAW value was closest to the dashboard target of " + String(dashboardValue, 2) + " km (difference: " + String(smallestRawDiffToDashboard) + " km).");
     
-    // Save the working PID
+    // Save the working PID and its RAW odometer reading
     preferences.begin("working_pids", false);
-    preferences.putString("odometerPID", closestPID);
-    preferences.putFloat("lastOdometer", closestValue);
+    preferences.putString("odometerPID", data.odometerPID);
+    preferences.putFloat("lastOdometer", data.mileage); // Save the raw odometer reading
     preferences.end();
-        } else {
-    logMessage(LOG_WARN, "\n❌ No odometer value found in 50k-70k range");
-    logMessage(LOG_INFO, "💡 Check the raw data above - odometer might be in a different format");
+  } else {
+    logMessage(LOG_WARN, "\n❌ No suitable odometer PID found whose RAW value was close to the dashboard target (" + String(dashboardValue, 2) + " km).");
+    // data.mileage will remain as initialized (likely 0), and data.odometerPID as "N/A"
   }
   
+  // Save all discovered PID results to SPIFFS
+  saveFullScanResultsToSPIFFS(allValues, discoveredCount);
+
   // Calculate data quality score
   data.dataQuality = (successCount * 100) / totalAttempts;
   
   // Try to get VIN
-  data.vin = "VIN_" + String(data.timestamp);
+  String fetchedVin = fetchVIN(elmClient); // Call the new function
+  if (fetchedVin.length() == 17) { // Check if a 17-character VIN was returned
+    data.vin = fetchedVin;
+  } else {
+    logMessage(LOG_WARN, "Fetched VIN is not 17 characters, using placeholder. VIN: " + fetchedVin);
+    data.vin = "VIN_" + String(data.timestamp); // Fallback to placeholder
+  }
   
   logMessage(LOG_INFO, "OBD data collection completed. Quality: " + String(data.dataQuality) + "%");
   return successCount > 0;

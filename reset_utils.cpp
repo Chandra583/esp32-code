@@ -1,25 +1,20 @@
-// SPIFFS Memory Reset Tool for ESP32
-// This code will completely clear SPIFFS and Preferences
-// Use this when you want to start fresh
+#include "reset_utils.h"
 
-#include <SPIFFS.h>
-#include <Preferences.h>
+Preferences preferences_reset_util; // Use a distinct name to avoid conflicts if Preferences is used elsewhere
 
-Preferences preferences;
-
-void setup() {
+void setupSerialAndWelcome() {
   Serial.begin(115200);
   delay(2000);
   
   Serial.println("🔄 ESP32 SPIFFS & Preferences Reset Tool");
   Serial.println("========================================");
-  
-  // Step 1: Format SPIFFS completely
+}
+
+void performSPIFFSFormat() {
   Serial.println("📁 Step 1: Formatting SPIFFS...");
   if (SPIFFS.begin(true)) {
     Serial.println("✅ SPIFFS mounted successfully");
     
-    // List all files before deletion
     Serial.println("📂 Files before reset:");
     File root = SPIFFS.open("/");
     File file = root.openNextFile();
@@ -34,7 +29,6 @@ void setup() {
     
     Serial.println("📊 Total files found: " + String(fileCount));
     
-    // Format SPIFFS (this deletes everything)
     Serial.println("🗑️  Formatting SPIFFS (deleting all files)...");
     if (SPIFFS.format()) {
       Serial.println("✅ SPIFFS formatted successfully - All files deleted!");
@@ -46,20 +40,25 @@ void setup() {
   } else {
     Serial.println("❌ Failed to mount SPIFFS");
   }
-  
-  // Step 2: Clear all Preferences
+}
+
+void performPreferencesClear() {
   Serial.println("\n🔧 Step 2: Clearing Preferences...");
   
-  // Clear vehicle config preferences
-  preferences.begin("vehicle_config", false);
-  preferences.clear();
-  preferences.end();
+  preferences_reset_util.begin("vehicle_config", false);
+  preferences_reset_util.clear();
+  preferences_reset_util.end();
   Serial.println("✅ Vehicle config preferences cleared");
   
-  // Clear any other preference namespaces you might have
   // Add more if you have other preference namespaces
-  
-  // Step 3: Verification
+  // For example:
+  // preferences_reset_util.begin("another_namespace", false);
+  // preferences_reset_util.clear();
+  // preferences_reset_util.end();
+  // Serial.println("✅ Another namespace preferences cleared");
+}
+
+void verifySystemReset() {
   Serial.println("\n🔍 Step 3: Verification...");
   
   if (SPIFFS.begin(true)) {
@@ -81,18 +80,31 @@ void setup() {
     }
   }
   
-  // Check preferences
-  preferences.begin("vehicle_config", true); // Read-only
-  size_t prefSize = preferences.getBytesLength("ngrokHost");
-  preferences.end();
-  
-  if (prefSize == 0) {
-    Serial.println("✅ Preferences are cleared");
-  } else {
-    Serial.println("⚠️  Warning: Some preferences may still exist");
+  preferences_reset_util.begin("vehicle_config", true); // Read-only
+  // To make verification more robust, we should check if any key exists, 
+  // rather than a specific key like "ngrokHost" if that might not always be present.
+  // However, Preferences library doesn't have a direct way to check if a namespace is empty 
+  // or list all keys. We'll stick to checking a known key or assuming if getBytesLength is 0 for one, it's likely cleared.
+  // A more thorough check would involve iterating known keys if they are predefined.
+  bool isVehicleConfigEmpty = true;
+  String key;
+  // Attempt to get the first key, if Preferences supports it in your version
+  // key = preferences_reset_util.getString("dummyKey", ""); // This is a conceptual check
+  // For now, we will check a specific key that you were checking previously.
+  // If 'ngrokHost' is not a guaranteed key, this check is not foolproof for all scenarios.
+  if (preferences_reset_util.getBytesLength("ngrokHost") > 0) { 
+      isVehicleConfigEmpty = false;
   }
+  preferences_reset_util.end();
   
-  // Final message
+  if (isVehicleConfigEmpty) {
+    Serial.println("✅ Preferences (vehicle_config) appear cleared");
+  } else {
+    Serial.println("⚠️  Warning: Some preferences may still exist in 'vehicle_config'");
+  }
+}
+
+void printResetCompletionMessages() {
   Serial.println("\n🎉 ===== RESET COMPLETE =====");
   Serial.println("✅ SPIFFS memory cleared");
   Serial.println("✅ Preferences cleared");
@@ -100,19 +112,4 @@ void setup() {
   Serial.println("\n💡 You can now upload your main code");
   Serial.println("🔄 Or reset this ESP32 to start fresh");
   Serial.println("================================");
-}
-
-void loop() {
-  // Blink LED to show reset is complete
-  digitalWrite(LED_BUILTIN, HIGH);
-  delay(1000);
-  digitalWrite(LED_BUILTIN, LOW);
-  delay(1000);
-  
-  // Print status every 10 seconds
-  static unsigned long lastPrint = 0;
-  if (millis() - lastPrint > 10000) {
-    Serial.println("💤 Reset complete - System idle (LED blinking)");
-    lastPrint = millis();
-  }
 } 
