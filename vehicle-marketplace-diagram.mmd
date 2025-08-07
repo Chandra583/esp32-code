@@ -1,0 +1,557 @@
+classDiagram
+    class User {
+        -ObjectId id
+        -string email
+        -string passwordHash
+        -string walletAddress
+        -string role
+        -string kycStatus
+        -object profileData
+        -Date createdAt
+        -Date updatedAt
+        -boolean isActive
+        -string phoneNumber
+        -string fullName
+        -number creditScore
+        +register(userData) User
+        +login(credentials) AuthToken
+        +updateProfile(profileData) boolean
+        +verifyKYC(documents) boolean
+        +changePassword(oldPass, newPass) boolean
+        +getRole() string
+        +isVerified() boolean
+    }
+
+    class Notification {
+        -ObjectId id
+        -ObjectId userId
+        -string notificationType
+        -string title
+        -string message
+        -object metadata
+        -boolean isRead
+        -string priority
+        -Date createdAt
+        -Date readAt
+        +create(userId, type, content) Notification
+        +markAsRead() boolean
+        +send() boolean
+        +schedule(sendTime) boolean
+        +getUnreadCount(userId) number
+    }
+
+    class AdminAction {
+        -ObjectId id
+        -ObjectId adminId
+        -string actionType
+        -string targetType
+        -ObjectId targetId
+        -string reason
+        -object previousState
+        -object newState
+        -Date actionDate
+        -string ipAddress
+        -string blockchainActionHash
+        +create(adminId, action) AdminAction
+        +logAction() boolean
+        +getActionHistory(adminId) AdminAction[]
+        +validateAction() boolean
+        +storeEvidence(evidenceData) string
+    }
+
+    class FraudDetectionAlert {
+        -ObjectId id
+        -ObjectId vehicleId
+        -ObjectId odometerReadingId
+        -string fraudType
+        -number fraudConfidence
+        -object detectionData
+        -object evidence
+        -string description
+        -string alertStatus
+        -ObjectId assignedInvestigator
+        -Date detectedAt
+        -Date resolvedAt
+        +create(vehicleId, fraudData) FraudDetectionAlert
+        +assignInvestigator(adminId) boolean
+        +resolve(resolution) boolean
+        +escalate() boolean
+        +getConfidenceLevel() number
+        +generateEvidenceBundle() string
+    }
+
+    class InvestigationCase {
+        -ObjectId id
+        -ObjectId vehicleId
+        -ObjectId initiatedBy
+        -string caseType
+        -string caseStatus
+        -object evidenceCollection
+        -object analysisResults
+        -string resolution
+        -Date caseOpenedAt
+        -Date caseClosedAt
+        +create(vehicleId, caseType) InvestigationCase
+        +addEvidence(evidence) boolean
+        +updateTimeline(event) boolean
+        +assignInvestigator(adminId) boolean
+        +closeCase(resolution) boolean
+        +generateReport() object
+    }
+
+    class FraudDetectionEngine {
+        -object patternAnalysisModel
+        -object anomalyDetectionModel
+        -object detectionRules
+        -number confidenceThreshold
+        +analyzeOdometerReading(reading) object
+        +detectPatterns(vehicleHistory) object
+        +calculateConfidence(analysisData) number
+        +trainModel(trainingData) boolean
+        +updateDetectionRules(rules) boolean
+        +generateAlert(fraudData) FraudDetectionAlert
+    }
+
+    class Vehicle {
+        -ObjectId id
+        -string vin
+        -ObjectId currentOwnerId
+        -string make
+        -string model
+        -number year
+        -string color
+        -string fuelType
+        -string nftTokenAddress
+        -string arweaveVehicleProfileId
+        -string registrationStatus
+        -number initialOdometer
+        -number currentOdometer
+        -number marketValue
+        -string conditionRating
+        -Date createdAt
+        -Date updatedAt
+        -boolean isActive
+        +register(vehicleData, ownerId) Vehicle
+        +updateOdometer(newReading) boolean
+        +transferOwnership(newOwnerId) boolean
+        +mintNFT() string
+        +validateVIN() boolean
+        +checkTampering() object
+        +getOwnershipHistory() object[]
+        +calculateMarketValue() number
+    }
+
+    class DeviceRegistration {
+        -ObjectId id
+        -ObjectId vehicleId
+        -string deviceSerialNumber
+        -string deviceManufacturer
+        -string deviceSignature
+        -string deviceStatus
+        -Date registeredAt
+        -Date lastHeartbeat
+        -ObjectId registeredBy
+        -string blockchainDeviceHash
+        -boolean isPrimary
+        +register(vehicleId, deviceData) DeviceRegistration
+        +generateSignature() string
+        +updateHeartbeat() boolean
+        +runDiagnostics() object
+        +validateIntegrity() boolean
+        +replacementRequired() boolean
+    }
+
+    class OdometerReading {
+        -ObjectId id
+        -ObjectId vehicleId
+        -ObjectId deviceId
+        -number odometerValue
+        -Date readingTimestamp
+        -object gpsLocation
+        -string deviceSignature
+        -string readingHash
+        -string blockchainTxHash
+        -string arweaveTxId
+        -ObjectId verifiedBy
+        -Date verifiedAt
+        -string verificationStatus
+        -boolean isDisputed
+        +create(vehicleId, reading) OdometerReading
+        +validate() boolean
+        +generateHash() string
+        +storeOnBlockchain() string
+        +verifySignature() boolean
+        +checkSequence() boolean
+        +flagAsDisputed(reason) boolean
+    }
+
+    class DailyTracking {
+        -ObjectId id
+        -ObjectId vehicleId
+        -Date trackingDate
+        -number startOdometer
+        -number endOdometer
+        -number totalDistance
+        -object gpsCoordinatesTimeline
+        -string dailyDataHash
+        -string verificationStatus
+        -string blockchainTxHash
+        -boolean isValidated
+        +aggregate(readings) DailyTracking
+        +calculateDistance() number
+        +generateHash() string
+        +validate() boolean
+        +detectAnomalies() object[]
+        +linkToPreviousDay() boolean
+    }
+
+    class VehicleListing {
+        -ObjectId id
+        -ObjectId vehicleId
+        -ObjectId sellerId
+        -ObjectId mandatoryHistoryReportId
+        -number askingPrice
+        -number reservePrice
+        -string description
+        -string condition
+        -object features
+        -object images
+        -string listingStatus
+        -Date listingExpires
+        -number viewCount
+        -number inquiryCount
+        +create(vehicleId, listingData) VehicleListing
+        +updatePrice(newPrice) boolean
+        +addImages(images) boolean
+        +incrementViews() boolean
+        +calculateAuthenticityScore() number
+        +expire() boolean
+        +approve(adminId) boolean
+    }
+
+    class VehicleHistoryReport {
+        -ObjectId id
+        -ObjectId vehicleId
+        -ObjectId requestedBy
+        -ObjectId processedBy
+        -Date reportStartDate
+        -Date reportEndDate
+        -number totalKmDriven
+        -number averageKmPerMonth
+        -object monthlyUsageBreakdown
+        -object completeOdometerProgression
+        -object verifiedServiceHistory
+        -string reportHash
+        -string arweaveReportId
+        -string reportStatus
+        -Date generatedAt
+        -number authenticityScore
+        +generate(vehicleId, requesterId) VehicleHistoryReport
+        +calculateAuthenticityScore() number
+        +detectFraudIndicators() object[]
+        +generatePDF() string
+        +verifyIntegrity() boolean
+        +makePublic() boolean
+    }
+
+    class HistoryVerificationRequest {
+        -ObjectId id
+        -ObjectId vehicleId
+        -ObjectId buyerId
+        -ObjectId listingId
+        -string requestType
+        -object specificConcerns
+        -number offeredPrice
+        -string verificationDepth
+        -string requestStatus
+        -Date requestedAt
+        -Date completedAt
+        -ObjectId processedBy
+        -number verificationFee
+        +create(vehicleId, buyerId, requestData) HistoryVerificationRequest
+        +process() VehicleHistoryReport
+        +calculateFee() number
+        +approve(adminId) boolean
+        +complete() boolean
+        +trackOutcome(purchased) boolean
+    }
+
+    class EscrowTransaction {
+        -ObjectId id
+        -ObjectId vehicleId
+        -ObjectId buyerId
+        -ObjectId sellerId
+        -ObjectId buyerHistoryRequestId
+        -number transactionAmount
+        -number escrowFee
+        -string escrowWalletAddress
+        -string smartContractAddress
+        -string status
+        -Date createdAt
+        -Date fundedAt
+        -Date transactionCompletedAt
+        -string fundingTxHash
+        -string releaseTxHash
+        +create(transactionData) EscrowTransaction
+        +fund(amount) boolean
+        +release() boolean
+        +dispute(reason) boolean
+        +verifyPhysicalInspection() boolean
+        +complete() boolean
+        +refund() boolean
+    }
+
+    class ServiceProvider {
+        -ObjectId id
+        -string companyName
+        -string licenseNumber
+        -string providerType
+        -object contactInfo
+        -object locationInfo
+        -string verificationStatus
+        -ObjectId verifiedBy
+        -Date verifiedAt
+        -object credentials
+        -number trustScore
+        +register(providerData) ServiceProvider
+        +verify(adminId) boolean
+        +updateTrustScore(score) boolean
+        +addCredential(credential) boolean
+        +getServiceHistory() object[]
+        +calculateTrustScore() number
+    }
+
+    class ServiceRecord {
+        -ObjectId id
+        -ObjectId vehicleId
+        -ObjectId serviceProviderId
+        -number odometerAtService
+        -Date serviceDate
+        -string serviceType
+        -string serviceDescription
+        -number serviceCost
+        -string serviceInvoiceNumber
+        -ObjectId verifiedBy
+        -Date verifiedAt
+        -string verificationStatus
+        +create(serviceData) ServiceRecord
+        +verify(adminId) boolean
+        +generateHash() string
+        +createCheckpoint() object
+        +validateOdometer() boolean
+        +calculateTrustImpact() number
+    }
+
+    class VerificationCheckpoint {
+        -ObjectId id
+        -ObjectId vehicleId
+        -ObjectId serviceRecordId
+        -string checkpointType
+        -number odometerAtCheckpoint
+        -Date checkpointDate
+        -string verifierType
+        -ObjectId verifierId
+        -string verificationCertificate
+        -string blockchainProof
+        -boolean isDisputed
+        +create(checkpointData) VerificationCheckpoint
+        +validate() boolean
+        +dispute(reason) boolean
+        +generateCertificate() string
+        +crossVerifyWithBlockchain() boolean
+        +updateTrustScore() boolean
+    }
+
+    class InsuranceProvider {
+        -ObjectId id
+        -string companyName
+        -string licenseNumber
+        -object contactInfo
+        -string status
+        -object coverageTypes
+        -object ratingInfo
+        -Date createdAt
+        +register(providerData) InsuranceProvider
+        +addCoverageType(coverageType) boolean
+        +updateRating(rating) boolean
+        +generateQuote(vehicleId) object
+        +createPolicy(policyData) object
+        +processQuote(vehicleData) object
+    }
+
+    class InsurancePolicy {
+        -ObjectId id
+        -ObjectId vehicleId
+        -ObjectId policyholderId
+        -ObjectId providerId
+        -ObjectId vehicleHistoryReportId
+        -string policyNumber
+        -number premiumAmount
+        -number coverageAmount
+        -Date policyStart
+        -Date policyEnd
+        -string policyStatus
+        -object coverageDetails
+        -number riskScore
+        +create(policyData) InsurancePolicy
+        +calculatePremium(riskScore) number
+        +renew() boolean
+        +cancel(reason) boolean
+        +processClaim(claimData) object
+        +updateRiskScore(newScore) boolean
+        +generateCertificate() string
+    }
+
+    class RiskAssessmentEngine {
+        -object riskModel
+        -object riskFactors
+        -object scoringRules
+        +assessVehicleRisk(vehicleId) object
+        +calculateRiskScore(vehicleData) number
+        +analyzeHistoryReport(report) object
+        +predictClaims(vehicleData) object
+        +updateRiskModel(claimsData) boolean
+        +generateRiskReport(assessment) object
+    }
+
+    class GovernmentAgency {
+        -ObjectId id
+        -string agencyName
+        -string agencyCode
+        -string agencyType
+        -object contactInfo
+        -object jurisdiction
+        -object reportingRequirements
+        -Date createdAt
+        +register(agencyData) GovernmentAgency
+        +setupAPIAccess() object
+        +generateComplianceReport() object
+        +requestLegalData(requestData) object
+        +monitorCompliance() object
+        +processViolation(violation) object
+    }
+
+    class TaxRecord {
+        -ObjectId id
+        -ObjectId transactionId
+        -ObjectId vehicleId
+        -number transactionValue
+        -number taxAmount
+        -number platformFee
+        -string taxType
+        -Date taxPeriod
+        -string paymentStatus
+        -Date calculatedAt
+        -Date paidAt
+        +create(transactionData) TaxRecord
+        +calculateTax(jurisdiction) number
+        +processPayment() boolean
+        +generateReceipt() object
+        +submitToAuthority() boolean
+        +validateCompliance() boolean
+    }
+
+    class ComplianceEngine {
+        -object complianceRules
+        -object monitoringMetrics
+        -object violationPatterns
+        +monitorPlatformCompliance() object
+        +detectViolations() object[]
+        +generateRegulatoryReport(agencyType) object
+        +processLegalDataRequest(request) object
+        +validateTaxCompliance() object
+        +trackRegulationChanges() object[]
+    }
+
+    class OwnershipHistory {
+        -ObjectId id
+        -ObjectId vehicleId
+        -ObjectId previousOwnerId
+        -ObjectId newOwnerId
+        -ObjectId transactionId
+        -number odometerAtTransfer
+        -number salePrice
+        -Date transferDate
+        -string transferMethod
+        -string blockchainProof
+        -boolean mileageVerified
+        +create(transferData) OwnershipHistory
+        +verify(adminId) boolean
+        +generateProof() string
+        +validateTransfer() boolean
+        +linkToBlockchain() string
+        +archiveRecord() boolean
+    }
+
+    class APIIntegration {
+        -ObjectId id
+        -string integrationName
+        -string integrationType
+        -string apiEndpoint
+        -string status
+        -Date lastSync
+        -ObjectId managedBy
+        +create(integrationData) APIIntegration
+        +sync() object
+        +testConnection() boolean
+        +updateStatus(status) boolean
+        +logSync(syncData) boolean
+        +handleError(error) boolean
+    }
+
+    class BlockchainService {
+        -object arweaveClient
+        -object polygonClient
+        -object solanaClient
+        +storeOnArweave(data) string
+        +storeOnPolygon(transactionData) string
+        +mintSolanaNFT(vehicleData) string
+        +verifyBlockchainIntegrity(hash) boolean
+        +createSmartContract(contractData) string
+        +executeSmartContract(address, method) object
+    }
+
+    User --> Vehicle : owns
+    User --> Notification : receives
+    User --> AdminAction : performs
+    
+    Vehicle --> DeviceRegistration : has
+    Vehicle --> OdometerReading : generates
+    Vehicle --> DailyTracking : aggregates
+    Vehicle --> VehicleListing : listed_as
+    DeviceRegistration --> OdometerReading : produces
+    OdometerReading --> DailyTracking : grouped_into
+    
+    OdometerReading --> FraudDetectionAlert : triggers
+    FraudDetectionAlert --> InvestigationCase : creates
+    Vehicle --> InvestigationCase : subject_of
+    FraudDetectionEngine --> FraudDetectionAlert : generates
+    
+    VehicleListing --> HistoryVerificationRequest : requested_for
+    HistoryVerificationRequest --> VehicleHistoryReport : generates
+    VehicleHistoryReport --> EscrowTransaction : enables
+    EscrowTransaction --> OwnershipHistory : creates
+    
+    ServiceProvider --> ServiceRecord : provides
+    ServiceRecord --> VerificationCheckpoint : creates
+    Vehicle --> ServiceRecord : receives
+    Vehicle --> VerificationCheckpoint : has
+    
+    InsuranceProvider --> InsurancePolicy : issues
+    VehicleHistoryReport --> InsurancePolicy : determines
+    Vehicle --> InsurancePolicy : covered_by
+    RiskAssessmentEngine --> InsurancePolicy : calculates_premium
+    
+    GovernmentAgency --> APIIntegration : uses
+    EscrowTransaction --> TaxRecord : generates
+    TaxRecord --> GovernmentAgency : reported_to
+    ComplianceEngine --> GovernmentAgency : reports_to
+    
+    Vehicle --> OwnershipHistory : has_history
+    BlockchainService --> Vehicle : secures
+    BlockchainService --> OdometerReading : stores
+    BlockchainService --> EscrowTransaction : processes
+    
+    FraudDetectionEngine --> OdometerReading : analyzes
+    RiskAssessmentEngine --> VehicleHistoryReport : evaluates
+    ComplianceEngine --> APIIntegration : monitors 

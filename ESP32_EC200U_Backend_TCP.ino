@@ -37,13 +37,23 @@ struct Config {
   
   // ========== VEHICLE SELECTION SYSTEM ==========
   // CHANGE THIS NUMBER TO SELECT YOUR VEHICLE:
-  // 1 = Hyundai i20 Sport Plus (2019-2023)
+  // 1 = Hyundai i20 Sport Plus (2019-2023) - FIXED VERSION
   // 2 = Maruti Vitara Brezza (2016-2023)
   // 3 = Manual PID Setup (configure your own PIDs below)
+  // 4 = Auto-Discovered PID & Scale (Run Discovery Mode 99 first to calibrate)
   // 99 = Discovery Mode (scan and find PIDs automatically)
 
   
-  uint8_t selectedVehicle = 1;  // <-- CHANGE THIS NUMBER (1 or 2 for your vehicles)
+  uint8_t selectedVehicle = 1;  // <-- CHANGE THIS NUMBER (1, 2, 3, 4, or 99)
+  
+  // ========== FIXED HYUNDAI i20 CONFIGURATION ==========
+  // Hyundai i20 Sport Plus 2020 - Corrected UDS implementation
+  struct HyundaiConfig {
+    const char* odometerCommand = "22 F1 90";  // UDS Mode 22, PID F190
+    float scaleFactor = 0.1;                   // 0.1 km per bit
+    uint16_t responseTimeout = 5000;           // 5 second timeout
+    const char* expectedResponse = "62 F1 90"; // UDS positive response
+  };
   
   // ========== MANUAL PID SETUP ==========
   // Use when selectedVehicle = 3 for other vehicles
@@ -68,6 +78,10 @@ struct Config {
   uint16_t primaryOdometerPID = 0xA6;
   uint16_t secondaryOdometerPID = 0x201C;
   uint16_t tertiaryOdometerPID = 0x22A6;
+
+  // For Auto-Discovered Mode (4) - populated from Preferences
+  char discoveredOdoPID_String[10]; 
+  float discoveredOdoScale;
 };
 
 Config config;
@@ -180,6 +194,26 @@ void configureVehiclePIDs() {
       logMessage(LOG_INFO, "🔧 Using Manual PID Configuration");
       break;
       
+    case 4: // Auto-Discovered PID & Scale
+      preferences.begin("discovered_config", true); // Open read-only
+      strlcpy(config.discoveredOdoPID_String, preferences.getString("discOdoPID", "N/A").c_str(), sizeof(config.discoveredOdoPID_String));
+      config.discoveredOdoScale = preferences.getFloat("discOdoScale", 1.0);
+      preferences.end();
+      logMessage(LOG_INFO, "🚗 Vehicle: Auto-Discovered PID & Scale Mode");
+      if (String(config.discoveredOdoPID_String) != "N/A" && String(config.discoveredOdoPID_String) != "") {
+        logMessage(LOG_INFO, "   Using Discovered PID: " + String(config.discoveredOdoPID_String) + " with Scale: " + String(config.discoveredOdoScale));
+      } else {
+        logMessage(LOG_WARN, "   No discovered PID/Scale found in Preferences. Auto-Discovered Mode may not work.");
+        // Fallback to default PIDs, but without a specific scale, this might not be ideal.
+        // Consider if a default behavior for mode 4 without saved data is needed, e.g., run discovery or use vehicle 1 settings.
+        // For now, it will attempt to use "N/A" as PID which will likely fail in fetchEnhancedOBDData.
+        config.primaryOdometerPID = config.hyundai_i20_primary; // Example fallback
+        config.secondaryOdometerPID = config.hyundai_i20_secondary;
+        config.tertiaryOdometerPID = config.hyundai_i20_tertiary;
+        logMessage(LOG_WARN, "   Falling back to Hyundai i20 PIDs for Mode 4 due to missing discovered data.");
+      }
+      break;
+      
     case 99: // Discovery Mode
       config.primaryOdometerPID = 0xA6;
       config.secondaryOdometerPID = 0x201C;
@@ -259,8 +293,13 @@ void setStatusLED(bool state, int blinkCount = 0) {
 
 // ==================== ENHANCED OBD FUNCTIONS ====================
 
-// Scaling factor for odometer correction (adjust as needed)
-const float ODOMETER_SCALING_FACTOR = 1.13; // Adjust this factor to match your dashboard
+// Scaling factor for odometer correction (adjust as needed for modes 1,2,3)
+const float ODOMETER_SCALING_FACTOR = 1.044; // General scaling factor, closer to your recent findings
+
+// Odometer validation ranges
+const float MIN_PLAUSIBLE_ODOMETER = 0.0;       // Minimum realistic odometer value
+const float MAX_PLAUSIBLE_ODOMETER = 999999.0;  // Maximum realistic odometer value  
+const float MIN_REASONABLE_ODOMETER = 1000.0;   // Minimum for used car (filter out clearly wrong values)
 
 // Helper function to convert PID to string and query safely
 float queryPIDSafe(uint16_t pidHex) {
@@ -269,6 +308,16 @@ float queryPIDSafe(uint16_t pidHex) {
   myELM327.queryPID(pidStr);
   delay(100);
   return myELM327.findResponse();
+}
+
+// Validate if a value is a plausible odometer reading
+bool isPlausibleOdometer(float value) {
+  return (value >= MIN_PLAUSIBLE_ODOMETER && value <= MAX_PLAUSIBLE_ODOMETER);
+}
+
+// Validate if a value is a reasonable odometer reading (excludes very low values)
+bool isReasonableOdometer(float value) {
+  return (value >= MIN_REASONABLE_ODOMETER && value <= MAX_PLAUSIBLE_ODOMETER);
 }
 
 // Manual ELM327 initialization with custom timeouts
@@ -505,8 +554,6 @@ bool fetchEnhancedOBDData(VehicleData &data) {
   data.dataQuality = 0;
   data.odometerPID = "N/A"; // Initialize odometerPID
   
-  float dashboardValue = 64800; // Declare dashboardValue earlier for the log message
-  
   // Test basic TCP connection first - use gateway IP from network info
   logMessage(LOG_INFO, "🔍 Testing TCP connection to OBD device...");
   WiFiClient testClient;
@@ -542,17 +589,10 @@ bool fetchEnhancedOBDData(VehicleData &data) {
     return false;
   }
   
-  // Try manual initialization first
   if (initializeELM327Manual(elmClient, workingHost, workingPort)) {
     logMessage(LOG_INFO, "✅ Manual ELM327 initialization successful");
-    
-    // Now try to use ELM327 library with the working connection
-    // Note: We'll skip the library's begin() since we already have a connection
-    
   } else {
     logMessage(LOG_ERROR, "❌ Manual ELM327 initialization failed");
-    
-    // Fall back to library initialization
     if (!myELM327.begin(elmClient, workingHost.c_str(), workingPort)) {
       logMessage(LOG_ERROR, "Failed to connect to ELM327 with library");
       return false;
@@ -564,7 +604,6 @@ bool fetchEnhancedOBDData(VehicleData &data) {
   int successCount = 0;
   int totalAttempts = 0;
   
-  // Manual OBD data collection function with proper parsing
   auto getOBDValue = [&](const String& pid, const String& description) -> float {
     logMessage(LOG_INFO, "Requesting " + description + " (PID: " + pid + ")");
     elmClient.println(pid);
@@ -577,456 +616,348 @@ bool fetchEnhancedOBDData(VehicleData &data) {
         char c = elmClient.read();
         response += c;
         if (response.indexOf(">") >= 0) {
-      break;
-    }
+          break;
+        }
       }
       delay(10);
     }
     
     logMessage(LOG_INFO, description + " response: " + response);
-    
-    // Clean up response - remove spaces and newlines
     response.replace(" ", "");
     response.replace("\r", "");
     response.replace("\n", "");
     response.replace(">", "");
     
-    // Check for different response types
     if (response.indexOf("NODATA") >= 0 || response.indexOf("STOPPED") >= 0) {
       logMessage(LOG_DEBUG, description + " - No data available");
       return 0.0;
     }
-    
     if (response.indexOf("SEARCHING") >= 0) {
       logMessage(LOG_DEBUG, description + " - Still searching");
       return 0.0;
     }
-    
-    // Check for simple "OK" response (vehicle might be off)
     if (response == "OK" || response == "OK\r" || response == "OK\n") {
       logMessage(LOG_DEBUG, description + " - Vehicle may be off (OK response)");
       return 0.0;
     }
-    
-    // Look for successful response pattern (starts with response header)
     if (response.length() >= 6) {
-      // For standard PIDs, look for response starting with 41 + PID
-      String expectedResponse = "41" + pid.substring(2); // Remove "01" prefix, add "41"
-      
+      String expectedResponse = "41" + pid.substring(2);
       if (response.indexOf(expectedResponse) >= 0) {
-        // Extract data bytes after the header
-        int dataStart = response.indexOf(expectedResponse) + expectedResponse.length();
-        String dataBytes = response.substring(dataStart);
-        
+        int dataStartIdx = response.indexOf(expectedResponse) + expectedResponse.length();
+        String dataBytes = response.substring(dataStartIdx);
         logMessage(LOG_DEBUG, "Data bytes: " + dataBytes);
-        
-        // Parse based on PID type
-        if (pid == "010C") { // RPM
-          if (dataBytes.length() >= 4) {
-            int A = strtol(dataBytes.substring(0, 2).c_str(), NULL, 16);
-            int B = strtol(dataBytes.substring(2, 4).c_str(), NULL, 16);
-            float rpm = ((A * 256) + B) / 4.0;
-            return rpm;
-          }
-        } else if (pid == "010D") { // Speed
-          if (dataBytes.length() >= 2) {
-            int speed = strtol(dataBytes.substring(0, 2).c_str(), NULL, 16);
-            return speed;
-          }
-        } else if (pid == "0105") { // Engine temp
-          if (dataBytes.length() >= 2) {
-            int temp = strtol(dataBytes.substring(0, 2).c_str(), NULL, 16) - 40;
-            return temp;
-          }
-        } else if (pid == "012F") { // Fuel level
-          if (dataBytes.length() >= 2) {
-            int fuel = strtol(dataBytes.substring(0, 2).c_str(), NULL, 16);
-            float fuelPercent = (fuel * 100.0) / 255.0;
-            return fuelPercent;
-          }
-        } else if (pid == "0131") { // Distance since codes cleared
-          if (dataBytes.length() >= 4) {
-            int A = strtol(dataBytes.substring(0, 2).c_str(), NULL, 16);
-            int B = strtol(dataBytes.substring(2, 4).c_str(), NULL, 16);
-            float distance = (A * 256) + B;
-            return distance;
-          }
+        if (pid == "010C" && dataBytes.length() >= 4) { // RPM
+          return ((strtol(dataBytes.substring(0, 2).c_str(), NULL, 16) * 256) + strtol(dataBytes.substring(2, 4).c_str(), NULL, 16)) / 4.0;
+        } else if (pid == "010D" && dataBytes.length() >= 2) { // Speed
+          return strtol(dataBytes.substring(0, 2).c_str(), NULL, 16);
+        } else if (pid == "0105" && dataBytes.length() >= 2) { // Engine temp
+          return strtol(dataBytes.substring(0, 2).c_str(), NULL, 16) - 40;
+        } else if (pid == "012F" && dataBytes.length() >= 2) { // Fuel level
+          return (strtol(dataBytes.substring(0, 2).c_str(), NULL, 16) * 100.0) / 255.0;
+        } else if (pid == "0131" && dataBytes.length() >= 4) { // Distance
+          return (strtol(dataBytes.substring(0, 2).c_str(), NULL, 16) * 256) + strtol(dataBytes.substring(2, 4).c_str(), NULL, 16);
         }
-        
-        // For other PIDs, return a positive value to indicate success
-        return 1.0;
+        return 1.0; // Generic success
       }
     }
-    
-    // Check for manufacturer-specific responses (like 7E8...)
     if (response.length() >= 8 && (response.startsWith("7E8") || response.startsWith("7E0") || response.startsWith("7DF"))) {
       logMessage(LOG_INFO, "Manufacturer-specific response detected: " + response);
-      
-      // Parse different manufacturer response formats
-      String cleanResponse = response;
-      cleanResponse.replace(">", "");
-      cleanResponse.replace("\r", "");
-      cleanResponse.replace("\n", "");
-      
-      // Method 1: For distance PID 0131, parse the 7E8 response
+      String cleanResponse = response; // Already cleaned mostly
       if (pid == "0131" && response.indexOf("7E8044131") >= 0) {
-        int dataStart = response.indexOf("7E8044131") + 9; // Skip "7E8044131"
-        String dataBytes = response.substring(dataStart);
-        dataBytes.replace(">", "");
-        
-        logMessage(LOG_INFO, "Distance data bytes: " + dataBytes);
-        
+        int dataStartIdx = response.indexOf("7E8044131") + 9;
+        String dataBytes = response.substring(dataStartIdx);
         if (dataBytes.length() >= 4) {
-          int A = strtol(dataBytes.substring(0, 2).c_str(), NULL, 16);
-          int B = strtol(dataBytes.substring(2, 4).c_str(), NULL, 16);
-          float distance = (A * 256) + B;
-          logMessage(LOG_INFO, "Parsed distance: " + String(distance) + " km (0x" + dataBytes.substring(0, 4) + ")");
-          return distance;
+          float dist = (strtol(dataBytes.substring(0, 2).c_str(), NULL, 16) * 256) + strtol(dataBytes.substring(2, 4).c_str(), NULL, 16);
+          logMessage(LOG_INFO, "Parsed distance: " + String(dist) + " km (0x" + dataBytes.substring(0, 4) + ")");
+          return dist;
         }
       }
-      
-      // Method 2: For odometer PIDs, try to extract multi-byte values
       if (cleanResponse.length() >= 12) {
-        // Try different data extraction methods
-        
-        // Extract last 4-6 bytes for potential odometer reading
         if (cleanResponse.length() >= 16) {
-          String odometerBytes = cleanResponse.substring(cleanResponse.length() - 8, cleanResponse.length() - 2);
-          if (odometerBytes.length() >= 6) {
-            // Try 3-byte odometer reading (common for high mileage vehicles)
-            int A = strtol(odometerBytes.substring(0, 2).c_str(), NULL, 16);
-            int B = strtol(odometerBytes.substring(2, 4).c_str(), NULL, 16);
-            int C = strtol(odometerBytes.substring(4, 6).c_str(), NULL, 16);
-            float odometer = (A * 65536) + (B * 256) + C; // 3-byte value
-            
-            if (odometer > 1000 && odometer < 999999) { // Reasonable odometer range
-              logMessage(LOG_INFO, "Parsed 3-byte odometer: " + String(odometer) + " km (0x" + odometerBytes + ")");
-              return odometer;
+          String odoBytes = cleanResponse.substring(cleanResponse.length() - 8, cleanResponse.length() - 2);
+          if (odoBytes.length() >= 6) {
+            float odo = (strtol(odoBytes.substring(0, 2).c_str(), NULL, 16) * 65536) + (strtol(odoBytes.substring(2, 4).c_str(), NULL, 16) * 256) + strtol(odoBytes.substring(4, 6).c_str(), NULL, 16);
+            if (odo > 1000 && odo < 999999) {
+              logMessage(LOG_INFO, "Parsed 3-byte odometer: " + String(odo) + " km (0x" + odoBytes + ")");
+              return odo;
             }
           }
         }
-        
-        // Try 2-byte value extraction
         String lastBytes = cleanResponse.substring(cleanResponse.length() - 4);
         if (lastBytes.length() >= 4) {
-          int A = strtol(lastBytes.substring(0, 2).c_str(), NULL, 16);
-          int B = strtol(lastBytes.substring(2, 4).c_str(), NULL, 16);
-          float value = (A * 256) + B;
-          
-          logMessage(LOG_INFO, "Extracted 2-byte value: " + String(value) + " (0x" + lastBytes + ")");
-          
-          // If this looks like a reasonable odometer reading, return it
-          if (value > 1000 && value < 999999) {
-            logMessage(LOG_INFO, "This appears to be an odometer reading!");
-            return value;
-          } else if (value > 0) {
-            return value; // Return any positive value
-          }
+          float val = (strtol(lastBytes.substring(0, 2).c_str(), NULL, 16) * 256) + strtol(lastBytes.substring(2, 4).c_str(), NULL, 16);
+          logMessage(LOG_INFO, "Extracted 2-byte value: " + String(val) + " (0x" + lastBytes + ")");
+          if (val > 1000 && val < 999999) return val;
+          else if (val > 0) return val;
         }
       }
-      
-      return 1.0; // Indicate successful communication
+      return 1.0; // Generic success
     }
-    
     return 0.0;
   };
   
-  // Collect basic parameters with manual method
-    totalAttempts++;
-  data.rpm = getOBDValue("010C", "RPM");
-  if (data.rpm > 0) {
-      successCount++;
-    logMessage(LOG_DEBUG, "RPM communication successful");
+  totalAttempts++; data.rpm = getOBDValue("010C", "RPM"); if (data.rpm > 0) successCount++;
+  totalAttempts++; data.speed = getOBDValue("010D", "Speed"); if (data.speed > 0) successCount++;
+  totalAttempts++; data.engineTemp = getOBDValue("0105", "Engine Temperature"); if (data.engineTemp > 0) successCount++;
+  totalAttempts++; data.fuelLevel = getOBDValue("012F", "Fuel Level"); if (data.fuelLevel > 0) successCount++;
+
+  totalAttempts++; // For odometer reading attempt
+  
+  // ===== INTELLIGENT ODOMETER READING STRATEGY =====
+  bool odometerFound = false;
+  
+  if (config.selectedVehicle == 4) { 
+    // AUTO-DISCOVERED MODE: Use previously saved PID and scale
+    logMessage(LOG_INFO, "🚗 AUTO-DISCOVERED MODE: Using saved PID and Scale.");
+    if (String(config.discoveredOdoPID_String) != "N/A" && String(config.discoveredOdoPID_String) != "") {
+      logMessage(LOG_INFO, "   Attempting to read PID: " + String(config.discoveredOdoPID_String) + " with Stored Scale: " + String(config.discoveredOdoScale, 4));
+      float rawValue = getOBDValue(String(config.discoveredOdoPID_String), "Discovered Odometer");
+      if (rawValue > 0.1 && isPlausibleOdometer(rawValue * config.discoveredOdoScale)) {
+        data.mileage = rawValue * config.discoveredOdoScale;
+        data.odometerPID = String(config.discoveredOdoPID_String);
+        odometerFound = true;
+        logMessage(LOG_INFO, "   ✅ Raw: " + String(rawValue, 2) + " -> Scaled: " + String(data.mileage, 2) + " km");
+      } else {
+        logMessage(LOG_WARN, "   ❌ Failed to read valid data from discovered PID");
+      }
+    } else {
+      logMessage(LOG_ERROR, "   ❌ No discovered PID saved for Auto-Discovered Mode");
+    }
   }
   
-  totalAttempts++;
-  data.speed = getOBDValue("010D", "Speed");
-  if (data.speed > 0) {
+  if (!odometerFound && (config.selectedVehicle == 1 || config.selectedVehicle == 2 || config.selectedVehicle == 3)) {
+    // PRE-CONFIGURED VEHICLE MODES: Try known PIDs in priority order
+    logMessage(LOG_INFO, "🚗 PRE-CONFIGURED MODE: Trying vehicle-specific PIDs");
+    
+    uint16_t pidsToTry[] = {config.primaryOdometerPID, config.secondaryOdometerPID, config.tertiaryOdometerPID};
+    String pidNames[] = {"Primary", "Secondary", "Tertiary"};
+    
+    for (int i = 0; i < 3; ++i) {
+      if (pidsToTry[i] == 0) continue;
+      
+      char pidStrHex[10]; 
+      sprintf(pidStrHex, "%04X", pidsToTry[i]);
+      logMessage(LOG_INFO, "   Trying " + String(pidNames[i]) + " PID: 0x" + String(pidStrHex));
+      
+      float rawValue = getOBDValue(String(pidStrHex), String(pidNames[i]) + " Odometer");
+      
+      if (rawValue > 0.1) {
+        float scaledValue = rawValue * ODOMETER_SCALING_FACTOR;
+        if (isReasonableOdometer(scaledValue)) {
+          data.mileage = scaledValue;
+          data.odometerPID = String(pidStrHex);
+          odometerFound = true;
+          
+          // Save this working PID for future use
+          preferences.begin("working_config", false);
+          preferences.putString("workingPID", String(pidStrHex));
+          preferences.putFloat("workingScale", ODOMETER_SCALING_FACTOR);
+          preferences.end();
+          
+          logMessage(LOG_INFO, "   ✅ " + String(pidNames[i]) + " PID WORKS! Raw: " + String(rawValue, 2) + " -> Scaled: " + String(data.mileage, 2) + " km");
+          break;
+        } else {
+          logMessage(LOG_WARN, "   ⚠️ " + String(pidNames[i]) + " PID returned unreasonable value: " + String(scaledValue, 2) + " km");
+        }
+      } else {
+        logMessage(LOG_DEBUG, "   ❌ " + String(pidNames[i]) + " PID: No valid response");
+      }
+    }
+  }
+  
+  if (!odometerFound && config.selectedVehicle == 99) {
+    // DISCOVERY MODE: Intelligent PID scanning without hardcoded target
+    logMessage(LOG_INFO, "🔍 DISCOVERY MODE: Intelligent PID scanning for odometer");
+    logMessage(LOG_INFO, "📊 Looking for PIDs returning plausible odometer values (1000-999999 km)");
+    
+    static DiscoveredValue allValues[200];
+    int discoveredCount = 0;
+    
+    static const String allPIDs[] = {
+      "0100", "0101", "0102", "0103", "0104", "0105", "0106", "0107", "0108", "0109", "010A", "010B", "010C", "010D", "010E", "010F", 
+      "0110", "0111", "0112", "0113", "0114", "0115", "0116", "0117", "0118", "0119", "011A", "011B", "011C", "011D", "011E", "011F", 
+      "0120", "0121", "0122", "0123", "0124", "0125", "0126", "0127", "0128", "0129", "012A", "012B", "012C", "012D", "012E", "012F", 
+      "0130", "0131", "0132", "0133", "0134", "0135", "0136", "0137", "0138", "0139", "013A", "013B", "013C", "013D", "013E", "013F", 
+      "0140", "0141", "0142", "0143", "0144", "0145", "0146", "0147", "0148", "0149", "014A", "014B", "014C", "014D", "014E", "014F", 
+      "0900", "0901", "0902", "0903", "0904", "0905", "0906", "0907", "0908", "0909", "090A", "090B", "090C", "090D", "090E", "090F", 
+      "2100", "2101", "2102", "2103", "2104", "2105", "2106", "2107", "2110", "2111", "2112", "2113", "2114", "2115", "2116", "2117", 
+      "211C", "211D", "211E", "211F", "21A6", "21A7", "21A8", "21A9", "2200", "2201", "2202", "2203", "2204", "2205", "2206", "2207", 
+      "2208", "2209", "220A", "220B", "220C", "220D", "220E", "220F", "2210", "2211", "2212", "2213", "2214", "2215", "2216", "2217", 
+      "2218", "2219", "221A", "221B", "221C", "221D", "221E", "221F", "2220", "2221", "2222", "2223", "2224", "2225", "2226", "2227", 
+      "22A0", "22A1", "22A2", "22A3", "22A4", "22A5", "22A6", "22A7", "22A8", "22A9", "22AA", "22AB", "22AC", "22AD", "22AE", "22AF", 
+      "22F0", "22F1", "22F2", "22F3", "22F4", "22F5", "22F6", "22F7", "22F190", "22F191", "22F192", "22F193", "22F194", "22F195", 
+      "201C", "201D", "201E", "201F", "00A6", "00A7", "00A8", "00A9"
+    };
+    
+    int totalPIDs = sizeof(allPIDs) / sizeof(allPIDs[0]);
+    logMessage(LOG_INFO, "📊 Starting intelligent scan of " + String(totalPIDs) + " PIDs...");
+    
+    for (int i = 0; i < totalPIDs; i++) {
+      String pid = allPIDs[i];
+      if (i % 20 == 0) logMessage(LOG_INFO, "📈 Progress: " + String(i) + "/" + String(totalPIDs) + " PIDs scanned");
+      
+      elmClient.println(pid);
+      delay(300);
+      String response = "";
+      unsigned long start = millis();
+      
+      while (millis() - start < 1500) {
+        if (elmClient.available()) {
+          char c = elmClient.read(); 
+          response += c;
+          if (response.indexOf(">") >= 0) break;
+        }
+      }
+      
+      if (response.length() > 0 && response.indexOf("NO DATA") < 0 && response.indexOf("STOPPED") < 0) {
+        String clean = response;
+        clean.replace(">", ""); clean.replace(" ", ""); clean.replace("\r", ""); clean.replace("\n", ""); clean.toUpperCase();
+        
+        if (clean.length() > 10) {
+          // Parse potential odometer values from response
+          bool foundValidValue = false;
+          
+          // Check CAN responses (7E8, 7E0, etc.)
+          if (clean.indexOf("7E8") >= 0) {
+            int dataStart = clean.indexOf("7E8") + 7; // Skip frame header
+            if (clean.length() > dataStart + 4) {
+              // Check different byte combinations for odometer values
+              for (int j = 0; j <= min(16, (int)(clean.length() - dataStart - 4)); j += 2) {
+                if (dataStart + j + 4 <= clean.length()) {
+                  String bytes = clean.substring(dataStart + j, dataStart + j + 4);
+                  unsigned long val = strtoul(bytes.c_str(), NULL, 16);
+                  if (isReasonableOdometer(val)) {
+                    logMessage(LOG_INFO, "  🎯 Found reasonable odometer: " + String(val) + " km (PID: " + pid + ", bytes: 0x" + bytes + ")");
+                    if (discoveredCount < 200) { 
+                      allValues[discoveredCount] = {pid, (float)val, clean}; 
+                      discoveredCount++; 
+                      foundValidValue = true; 
+                    }
+                  }
+                }
+                // Also check 3-byte values
+                if (dataStart + j + 6 <= clean.length()) {
+                  String bytes = clean.substring(dataStart + j, dataStart + j + 6);
+                  unsigned long val = strtoul(bytes.c_str(), NULL, 16);
+                  if (isReasonableOdometer(val)) {
+                    logMessage(LOG_INFO, "  🎯 Found reasonable odometer (3-byte): " + String(val) + " km (PID: " + pid + ", bytes: 0x" + bytes + ")");
+                    if (discoveredCount < 200) { 
+                      allValues[discoveredCount] = {pid, (float)val, clean}; 
+                      discoveredCount++; 
+                      foundValidValue = true; 
+                    }
+                  }
+                }
+              }
+            }
+          }
+          
+          // Check Mode 22 responses (starts with 62)
+          if (clean.indexOf("62") >= 0) {
+            int dataStart = clean.indexOf("62") + 6; // Skip mode 22 header
+            if (clean.length() > dataStart + 4) {
+              for (int j = 0; j <= min(16, (int)(clean.length() - dataStart - 4)); j += 2) {
+                if (dataStart + j + 4 <= clean.length()) {
+                  String bytes = clean.substring(dataStart + j, dataStart + j + 4);
+                  unsigned long val = strtoul(bytes.c_str(), NULL, 16);
+                  if (isReasonableOdometer(val)) {
+                    logMessage(LOG_INFO, "  🎯 Found reasonable Mode 22 odometer: " + String(val) + " km (PID: " + pid + ", bytes: 0x" + bytes + ")");
+                    if (discoveredCount < 200) { 
+                      allValues[discoveredCount] = {pid, (float)val, clean}; 
+                      discoveredCount++; 
+                      foundValidValue = true; 
+                    }
+                  }
+                }
+              }
+            }
+          }
+          
+          // Save all responses for analysis even if no valid odometer found
+          if (!foundValidValue && discoveredCount < 200) {
+            allValues[discoveredCount] = {pid, 0, clean};
+            discoveredCount++;
+          }
+        }
+      }
+      delay(100);
+    }
+    
+    logMessage(LOG_INFO, "\n📊 ===== DISCOVERY SCAN COMPLETE =====");
+    logMessage(LOG_INFO, "Scanned " + String(totalPIDs) + " PIDs");
+    logMessage(LOG_INFO, "Found " + String(discoveredCount) + " responses with data");
+    
+    // Find the best odometer candidate
+    float bestOdometerValue = 0;
+    String bestOdometerPID = "";
+    int validCandidates = 0;
+    
+    logMessage(LOG_INFO, "\n🔍 Analyzing odometer candidates:");
+    for (int i = 0; i < discoveredCount; i++) {
+      if (allValues[i].value > 0.1 && isReasonableOdometer(allValues[i].value)) {
+        validCandidates++;
+        logMessage(LOG_INFO, "  Candidate " + String(validCandidates) + ": PID " + allValues[i].pid + " = " + String(allValues[i].value, 2) + " km");
+        
+        // Choose the highest reasonable value (odometers only increase)
+        if (allValues[i].value > bestOdometerValue) {
+          bestOdometerValue = allValues[i].value;
+          bestOdometerPID = allValues[i].pid;
+        }
+      }
+    }
+    
+    if (bestOdometerPID != "" && bestOdometerValue > 0) {
+      data.mileage = bestOdometerValue;
+      data.odometerPID = bestOdometerPID;
+      odometerFound = true;
+      
+      // Save discovered PID for future use
+      preferences.begin("discovered_config", false);
+      preferences.putString("discOdoPID", bestOdometerPID);
+      preferences.putFloat("discOdoScale", 1.0); // Raw value is already correct
+      preferences.putFloat("discLastDash", bestOdometerValue);
+      preferences.end();
+      
+      logMessage(LOG_INFO, "\n🎉 DISCOVERY SUCCESS!");
+      logMessage(LOG_INFO, "   Best PID: " + bestOdometerPID + " = " + String(bestOdometerValue, 2) + " km");
+      logMessage(LOG_INFO, "   Saved for Auto-Discovered Mode (selectedVehicle = 4)");
+    } else {
+      logMessage(LOG_WARN, "\n❌ DISCOVERY: No reasonable odometer PIDs found");
+      logMessage(LOG_INFO, "   Consider checking vehicle connection or trying different PID ranges");
+    }
+    
+    // Save full scan results for analysis
+    saveFullScanResultsToSPIFFS(allValues, discoveredCount);
+  }
+  
+  // Final odometer status
+  if (odometerFound) {
     successCount++;
-    logMessage(LOG_DEBUG, "Speed communication successful");
-  }
-  
-    totalAttempts++;
-  data.engineTemp = getOBDValue("0105", "Engine Temperature");
-  if (data.engineTemp > 0) {
-      successCount++;
-    logMessage(LOG_DEBUG, "Engine temp communication successful");
-  }
-  
-    totalAttempts++;
-  data.fuelLevel = getOBDValue("012F", "Fuel Level");
-  if (data.fuelLevel > 0) {
-      successCount++;
-    logMessage(LOG_DEBUG, "Fuel level communication successful");
-  }
-
-  // Get total odometer reading using manual method
-  totalAttempts++;
-  
-  // EXHAUSTIVE PID SCANNER for Hyundai i20
-  logMessage(LOG_INFO, "🔍 EXHAUSTIVE PID SCANNER - Testing 139+ PIDs...");
-  logMessage(LOG_INFO, "🎯 Target: Find odometer reading around " + String(dashboardValue, 2) + " km");
-  
-  // Array to store all discovered values
-  static DiscoveredValue allValues[200];
-  int discoveredCount = 0;
-  
-  // Comprehensive PID list - 139 PIDs to test
-  static const String allPIDs[] = {
-    // Standard OBD-II PIDs (Mode 01)
-    "0100", "0101", "0102", "0103", "0104", "0105", "0106", "0107",
-    "0108", "0109", "010A", "010B", "010C", "010D", "010E", "010F",
-    "0110", "0111", "0112", "0113", "0114", "0115", "0116", "0117",
-    "0118", "0119", "011A", "011B", "011C", "011D", "011E", "011F",
-    "0120", "0121", "0122", "0123", "0124", "0125", "0126", "0127",
-    "0128", "0129", "012A", "012B", "012C", "012D", "012E", "012F",
-    "0130", "0131", "0132", "0133", "0134", "0135", "0136", "0137",
-    "0138", "0139", "013A", "013B", "013C", "013D", "013E", "013F",
-    "0140", "0141", "0142", "0143", "0144", "0145", "0146", "0147",
-    "0148", "0149", "014A", "014B", "014C", "014D", "014E", "014F",
-    
-    // Mode 09 PIDs
-    "0900", "0901", "0902", "0903", "0904", "0905", "0906", "0907",
-    "0908", "0909", "090A", "090B", "090C", "090D", "090E", "090F",
-    
-    // Mode 21 PIDs (Hyundai/Kia specific)
-    "2100", "2101", "2102", "2103", "2104", "2105", "2106", "2107",
-    "2110", "2111", "2112", "2113", "2114", "2115", "2116", "2117",
-    "211C", "211D", "211E", "211F", "21A6", "21A7", "21A8", "21A9",
-    
-    // Mode 22 PIDs (Extended diagnostics) - FULL RANGE
-    "2200", "2201", "2202", "2203", "2204", "2205", "2206", "2207",
-    "2208", "2209", "220A", "220B", "220C", "220D", "220E", "220F",
-    "2210", "2211", "2212", "2213", "2214", "2215", "2216", "2217",
-    "2218", "2219", "221A", "221B", "221C", "221D", "221E", "221F",
-    "2220", "2221", "2222", "2223", "2224", "2225", "2226", "2227",
-    "22A0", "22A1", "22A2", "22A3", "22A4", "22A5", "22A6", "22A7",
-    "22A8", "22A9", "22AA", "22AB", "22AC", "22AD", "22AE", "22AF",
-    "22F0", "22F1", "22F2", "22F3", "22F4", "22F5", "22F6", "22F7",
-    "22F190", "22F191", "22F192", "22F193", "22F194", "22F195",
-    
-    // Additional Hyundai-specific PIDs
-    "201C", "201D", "201E", "201F", "00A6", "00A7", "00A8", "00A9"
-  };
-  
-  int totalPIDs = sizeof(allPIDs) / sizeof(allPIDs[0]);
-  logMessage(LOG_INFO, "📊 Starting scan of " + String(totalPIDs) + " PIDs...");
-  
-  // Scan each PID
-  for (int i = 0; i < totalPIDs; i++) {
-    String pid = allPIDs[i];
-    
-    // Progress indicator
-    if (i % 10 == 0) {
-      logMessage(LOG_INFO, "\n📈 Progress: " + String(i) + "/" + String(totalPIDs) + " PIDs scanned...");
-    }
-    
-    // Send PID request
-    elmClient.println(pid);
-    delay(300);
-    
-    String response = "";
-    unsigned long start = millis();
-    while (millis() - start < 1500) {
-      if (elmClient.available()) {
-        char c = elmClient.read();
-        response += c;
-        if (response.indexOf(">") >= 0) break;
-      }
-    }
-    
-    // Only process if we got data
-    if (response.length() > 0 && response.indexOf("NO DATA") < 0 && response.indexOf("STOPPED") < 0) {
-      // Clean response
-      String clean = response;
-      clean.replace(">", "");
-      clean.replace(" ", "");
-      clean.replace("\r", "");
-      clean.replace("\n", "");
-      clean.toUpperCase();
-      
-      // Log responses that have substantial data
-      if (clean.length() > 10) {
-        logMessage(LOG_INFO, "PID " + pid + ": " + clean);
-        
-        // Try to extract numeric values
-        bool foundValue = false;
-        
-        // Method 1: Look for 7E8 responses
-        if (clean.indexOf("7E8") >= 0) {
-          int dataStart = clean.indexOf("7E8") + 3;
-          if (clean.length() > dataStart + 4) {
-            // Skip length and service bytes
-            dataStart += 4;
-            
-            // Try different byte combinations
-            for (int j = 0; j <= clean.length() - dataStart - 4 && j < 16; j += 2) {
-              // 2-byte value
-              if (dataStart + j + 4 <= clean.length()) {
-                String bytes = clean.substring(dataStart + j, dataStart + j + 4);
-                unsigned long val = strtoul(bytes.c_str(), NULL, 16);
-                
-                if (val >= 50000 && val <= 65000) {
-                  logMessage(LOG_INFO, "  🎯 Found potential odometer: " + String(val) + " km (0x" + bytes + ")");
-                  if (discoveredCount < 200) {
-                    allValues[discoveredCount].pid = pid;
-                    allValues[discoveredCount].value = val;
-                    allValues[discoveredCount].rawResponse = response;
-                    discoveredCount++;
-                    foundValue = true;
-      }
-    }
-              }
-              
-              // 3-byte value
-              if (dataStart + j + 6 <= clean.length()) {
-                String bytes = clean.substring(dataStart + j, dataStart + j + 6);
-                unsigned long val = strtoul(bytes.c_str(), NULL, 16);
-                
-                if (val >= 50000 && val <= 65000) {
-                  logMessage(LOG_INFO, "  🎯 Found potential odometer: " + String(val) + " km (0x" + bytes + ")");
-                  if (discoveredCount < 200) {
-                    allValues[discoveredCount].pid = pid;
-                    allValues[discoveredCount].value = val;
-                    allValues[discoveredCount].rawResponse = response;
-                    discoveredCount++;
-                    foundValue = true;
-                  }
-                }
-              }
-            }
-          }
-        }
-        
-        // Method 2: Look for 62 responses (Mode 22)
-        if (clean.indexOf("62") >= 0) {
-          int dataStart = clean.indexOf("62") + 2;
-          if (clean.length() > dataStart + 4) {
-            // Skip PID echo
-            dataStart += 4;
-            
-            // Try to extract odometer value
-            for (int j = 0; j <= clean.length() - dataStart - 4 && j < 16; j += 2) {
-              if (dataStart + j + 4 <= clean.length()) {
-                String bytes = clean.substring(dataStart + j, dataStart + j + 4);
-                unsigned long val = strtoul(bytes.c_str(), NULL, 16);
-                
-                if (val >= 50000 && val <= 65000) {
-                  logMessage(LOG_INFO, "  🎯 Found potential odometer: " + String(val) + " km (0x" + bytes + ")");
-                  if (discoveredCount < 200) {
-                    allValues[discoveredCount].pid = pid;
-                    allValues[discoveredCount].value = val;
-                    allValues[discoveredCount].rawResponse = response;
-                    discoveredCount++;
-                    foundValue = true;
-                  }
-                }
-              }
-            }
-          }
-        }
-        
-        // Store any response with data for later analysis
-        if (!foundValue && discoveredCount < 200) {
-          allValues[discoveredCount].pid = pid;
-          allValues[discoveredCount].value = 0;
-          allValues[discoveredCount].rawResponse = clean;
-          discoveredCount++;
-        }
-      }
-    }
-    
-    delay(100);
-  }
-  
-  // Display results
-  logMessage(LOG_INFO, "\n📊 ===== SCAN COMPLETE =====");
-  logMessage(LOG_INFO, "Scanned " + String(totalPIDs) + " PIDs");
-  logMessage(LOG_INFO, "Found " + String(discoveredCount) + " responses with data");
-  
-  // dashboardValue is already declared earlier in the function now
-  logMessage(LOG_INFO, "\n🎯 Identifying Odometer PID: Comparing RAW PID values to dashboard target (" + String(dashboardValue, 2) + " km).");
-  logMessage(LOG_INFO, "   The reported mileage will be the RAW value from the selected PID.");
-
-  float bestRawOdometerValue = 0; 
-  String bestOdometerPID = "";
-  float smallestRawDiffToDashboard = 999999;  
-
-  for (int i = 0; i < discoveredCount; i++) {
-    if (allValues[i].value > 0) { // Consider any PID that had a numeric value parsed
-      
-      float currentRawPidValue = allValues[i].value;
-      float diffCurrentRawPidToDashboard = abs(currentRawPidValue - dashboardValue); 
-      
-      String logMarker = "";
-      if (diffCurrentRawPidToDashboard < smallestRawDiffToDashboard) {
-          logMarker = " (NEW BEST RAW CANDIDATE TO MATCH DASHBOARD TARGET)";
-      }
-
-      // Log current PID's raw value and its difference from the dashboard target
-      logMessage(LOG_INFO, "PID " + allValues[i].pid + 
-                           ": RAW_VALUE=" + String(currentRawPidValue) + " km." +
-                           " Diff_from_target=" + String(diffCurrentRawPidToDashboard) + "km." + logMarker);
-      logMessage(LOG_INFO, "  Raw hex response: " + allValues[i].rawResponse); // Already logged during scan but good for context here
-      
-      // Special log for PID 0180 if it's still relevant for any specific checks
-      if (allValues[i].pid == "0180") {
-        logMessage(LOG_INFO, "  >>> PID 0180 Special Check: RAW=" + String(allValues[i].value) + ", Target_Dashboard_Val=" + String(dashboardValue));
-      }
-      
-      // Update selection if this PID's raw value is closer to the dashboard target
-      if (diffCurrentRawPidToDashboard < smallestRawDiffToDashboard) {
-        smallestRawDiffToDashboard = diffCurrentRawPidToDashboard;
-        bestRawOdometerValue = currentRawPidValue; // Store the raw value itself
-        bestOdometerPID = allValues[i].pid;
-      }
-    }
-  }
-  
-  // Also show PIDs with substantial data (rawResponse) for manual inspection if their value was 0
-  // This helps to spot PIDs that returned data but not in a simple numeric format we parsed as allValues[i].value
-  logMessage(LOG_INFO, "\n📋 PIDs with other substantial data (for manual inspection if not chosen or value was 0):");
-  for (int i = 0; i < discoveredCount && i < 20; i++) { // Limit to avoid too much logging
-    if (allValues[i].value == 0 && allValues[i].rawResponse.length() > 10) { // Check for decent length non-numeric responses
-      logMessage(LOG_INFO, "PID " + allValues[i].pid + ": " + allValues[i].rawResponse.substring(0, 40) + "...");
-    }
-  }
-  
-  if (bestOdometerPID != "") { // Check if a PID was selected
-    data.mileage = bestRawOdometerValue; // Assign the selected RAW value
-    successCount++; 
-    data.odometerPID = bestOdometerPID; 
-    logMessage(LOG_INFO, "\n🎉 FOUND ODOMETER: " + String(data.mileage) + " km (RAW value) from PID " + data.odometerPID);
-    logMessage(LOG_INFO, "   This PID's RAW value was closest to the dashboard target of " + String(dashboardValue, 2) + " km (difference: " + String(smallestRawDiffToDashboard) + " km).");
-    
-    // Save the working PID and its RAW odometer reading
-    preferences.begin("working_pids", false);
-    preferences.putString("odometerPID", data.odometerPID);
-    preferences.putFloat("lastOdometer", data.mileage); // Save the raw odometer reading
-    preferences.end();
+    logMessage(LOG_INFO, "✅ ODOMETER READ SUCCESSFULLY: " + String(data.mileage, 2) + " km (PID: " + data.odometerPID + ")");
   } else {
-    logMessage(LOG_WARN, "\n❌ No suitable odometer PID found whose RAW value was close to the dashboard target (" + String(dashboardValue, 2) + " km).");
-    // data.mileage will remain as initialized (likely 0), and data.odometerPID as "N/A"
+    data.mileage = 0; 
+    data.odometerPID = "N/A_AllMethodsFailed";
+    logMessage(LOG_ERROR, "❌ ODOMETER READ FAILED: All methods exhausted");
   }
   
-  // Save all discovered PID results to SPIFFS
-  saveFullScanResultsToSPIFFS(allValues, discoveredCount);
-
-  // Calculate data quality score
-  data.dataQuality = (successCount * 100) / totalAttempts;
+  // Common final steps for fetchEnhancedOBDData, now correctly within the function scope
+  if (totalAttempts > 0) { 
+    data.dataQuality = (successCount * 100) / totalAttempts;
+  } else {
+    data.dataQuality = 0; // Avoid division by zero if no attempts were made (e.g. early exit)
+  }
   
-  // Try to get VIN
-  String fetchedVin = fetchVIN(elmClient); // Call the new function
-  if (fetchedVin.length() == 17) { // Check if a 17-character VIN was returned
+  String fetchedVin = fetchVIN(elmClient); 
+  if (fetchedVin.length() == 17) { 
     data.vin = fetchedVin;
   } else {
     logMessage(LOG_WARN, "Fetched VIN is not 17 characters, using placeholder. VIN: " + fetchedVin);
-    data.vin = "VIN_" + String(data.timestamp); // Fallback to placeholder
+    data.vin = "VIN_" + String(data.timestamp); 
   }
   
   logMessage(LOG_INFO, "OBD data collection completed. Quality: " + String(data.dataQuality) + "%");
   return successCount > 0;
-}
+} // This is the CORRECT closing brace for fetchEnhancedOBDData
 
 // ==================== ENHANCED CELLULAR FUNCTIONS ====================
 
@@ -1110,7 +1041,7 @@ int parseHttpStatus(const String& response) {
   return 0;
 }
 
-// HTTP POST function based on your working reference code
+// HTTP POST function - Simplified for ngrok (no SSL needed)
 bool sendHttpPostEnhanced(const String& payload) {
   // Try up to 3 times
   for (int attempt = 1; attempt <= 3; attempt++) {
@@ -1124,6 +1055,7 @@ bool sendHttpPostEnhanced(const String& payload) {
     sendAT("AT+QHTTPCFG=\"contextid\",1");
     sendAT("AT+QHTTPCFG=\"responseheader\",1");
     sendAT("AT+QHTTPCFG=\"contenttype\",1");  // 1 = application/json
+    // Remove SSL config - ngrok handles HTTPS automatically
     
     // Build URL - use HTTPS like your working code
     String url = "https://" + String(config.ngrokHost) + "/esp32-status";
@@ -1149,7 +1081,6 @@ bool sendHttpPostEnhanced(const String& payload) {
         SerialMon.write(c);
         response += c;
         
-        // Check if we have CONNECT in the response
         if (response.indexOf("CONNECT") >= 0) {
           connectFound = true;
           break;
@@ -1158,16 +1089,16 @@ bool sendHttpPostEnhanced(const String& payload) {
     }
     
     if (!connectFound) {
-      logMessage(LOG_WARN, "❌ No CONNECT prompt for URL");
+      logMessage(LOG_WARN, "❌ No CONNECT prompt for URL - Attempt " + String(attempt));
       continue;
     }
     
     // Send the URL
-    logMessage(LOG_INFO, "Sending URL: " + url);
+    logMessage(LOG_INFO, "✅ Sending URL: " + url);
     SerialAT.print(url);
     delay(1000);
     
-    // Get all available data
+    // Clear any response data
     while (SerialAT.available()) {
       SerialMon.write(SerialAT.read());
     }
@@ -1203,32 +1134,31 @@ bool sendHttpPostEnhanced(const String& payload) {
     }
     
     if (!connectFound) {
-      logMessage(LOG_WARN, "❌ No CONNECT prompt for POST");
+      logMessage(LOG_WARN, "❌ No CONNECT prompt for POST - Attempt " + String(attempt));
       continue;
     }
     
-    // SEND JSON PAYLOAD - this is crucial
-    logMessage(LOG_INFO, "➡️ Sending JSON payload: " + payload);
+    // SEND JSON PAYLOAD
+    logMessage(LOG_INFO, "➡️ Sending JSON payload (" + String(payload.length()) + " bytes)");
     SerialAT.print(payload);
     
-    // Increase delay to make sure data is fully sent
-    delay(500);
+    // Wait for data to be sent
+    delay(1000);
     
     // Wait for POST result
     response = "";
     start = millis();
     bool statusFound = false;
-    while (millis() - start < 10000 && !statusFound) {
+    while (millis() - start < 15000 && !statusFound) { // Increased timeout
       if (SerialAT.available()) {
         char c = SerialAT.read();
         SerialMon.write(c);
         response += c;
         
-        // Look for +QHTTPPOST anywhere in the response
+        // Look for HTTP response
         if (response.indexOf("+QHTTPPOST:") >= 0) {
           statusFound = true;
-          // Wait a bit more to get the full response
-          delay(200);
+          delay(500); // Wait for complete response
           while (SerialAT.available()) {
             c = SerialAT.read();
             SerialMon.write(c);
@@ -1238,49 +1168,53 @@ bool sendHttpPostEnhanced(const String& payload) {
       }
     }
     
-    // Simplified HTTP status code parsing - the response might have newlines
+    // Parse HTTP status code
     int httpPostPos = response.indexOf("+QHTTPPOST:");
     if (httpPostPos >= 0) {
       String restOfResponse = response.substring(httpPostPos);
       
-      // Extract HTTP status code using a simple digit search
-      int statusCode = 0;
-      // Look for the pattern: "+QHTTPPOST: 0,200,15" and extract the 200 part
+      // Extract status: "+QHTTPPOST: 0,200,15"
       int commaPos = restOfResponse.indexOf(',');
       if (commaPos > 0) {
         int secondCommaPos = restOfResponse.indexOf(',', commaPos + 1);
         if (secondCommaPos > 0) {
           String statusStr = restOfResponse.substring(commaPos + 1, secondCommaPos);
           statusStr.trim();
-          statusCode = statusStr.toInt();
+          int statusCode = statusStr.toInt();
           
-          logMessage(LOG_INFO, "HTTP Status Code: " + String(statusCode));
+          logMessage(LOG_INFO, "🌐 HTTP Status: " + String(statusCode));
           
           if (statusCode >= 200 && statusCode < 300) {
-            // Success! (2xx status codes)
+            logMessage(LOG_INFO, "✅ SUCCESS! Data sent to server (Status: " + String(statusCode) + ")");
+            
+            // Try to read server response
             sendAT("AT+QHTTPREAD=80", 5000);
-            logMessage(LOG_INFO, "✅ Server responded with status: " + String(statusCode));
             sendAT("AT+QHTTPSTOP", 1000);
             return true;
           } else {
-            logMessage(LOG_ERROR, "❌ Server responded with error status: " + String(statusCode));
+            logMessage(LOG_ERROR, "❌ Server error (Status: " + String(statusCode) + ")");
           }
         }
       }
       
-      logMessage(LOG_INFO, "Raw response: " + restOfResponse);
+      logMessage(LOG_DEBUG, "Raw response: " + restOfResponse);
     } else {
-      logMessage(LOG_ERROR, "❌ Could not find +QHTTPPOST in response");
-      logMessage(LOG_INFO, "Full response: " + response);
+      logMessage(LOG_ERROR, "❌ No HTTP POST response found");
+      logMessage(LOG_DEBUG, "Full response: " + response);
     }
     
-    // Try to read response anyway for debugging
-    sendAT("AT+QHTTPREAD=80", 5000);
-    
-    // Close HTTP session before next attempt
+    // Read any response for debugging
+    sendAT("AT+QHTTPREAD=80", 3000);
     sendAT("AT+QHTTPSTOP", 1000);
+    
+    // Wait before retry
+    if (attempt < 3) {
+      logMessage(LOG_INFO, "⏳ Waiting 2 seconds before retry...");
+      delay(2000);
+    }
   }
   
+  logMessage(LOG_ERROR, "❌ All HTTP POST attempts failed");
   return false;
 }
 
@@ -1518,9 +1452,23 @@ bool connectToVeepeak() {
   WiFi.begin(config.veepeakSSID, config.veepeakPassword);
   
   unsigned long start = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) {
+  int attempts = 0;
+  const int maxAttempts = 30; // 15 seconds total
+  
+  while (WiFi.status() != WL_CONNECTED && attempts < maxAttempts) {
     delay(500);
+    yield(); // Feed watchdog and allow other tasks
     SerialMon.print(".");
+    attempts++;
+    
+    // Reset WiFi if taking too long
+    if (attempts > 20) {
+      logMessage(LOG_WARN, "WiFi connection slow, resetting...");
+      WiFi.disconnect();
+      delay(1000);
+      WiFi.begin(config.veepeakSSID, config.veepeakPassword);
+      attempts = 0; // Reset counter
+    }
   }
   
   if (WiFi.status() == WL_CONNECTED) {
@@ -1532,7 +1480,7 @@ bool connectToVeepeak() {
     logMessage(LOG_ERROR, "❌ Failed to connect to WiFi_OBDII");
     return false;
   }
-}
+} 
 
 void disconnectFromVeepeak() {
   WiFi.disconnect(true);
@@ -1611,6 +1559,49 @@ void updateNetworkInfo() {
   
   // Save network information to file
   saveNetworkInfo(networkInfo);
+}
+
+// Enhanced deep sleep with proper cleanup
+void enterDeepSleepSafely(uint32_t sleepMinutes) {
+  logMessage(LOG_INFO, "🔧 Preparing for safe deep sleep...");
+  
+  // 1. Disconnect WiFi and disable radio
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+  delay(100);
+  
+  // 2. Close all SPIFFS operations
+  SPIFFS.end();
+  
+  // 3. Close preferences
+  preferences.end();
+  
+  // 4. Disable Bluetooth (if enabled)
+  btStop();
+  
+  // 5. Power down cellular modem properly
+  sendAT("AT+QPOWD=1", 5000);
+  delay(2000);
+  
+  // 6. Configure sleep parameters for minimum power
+  esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH, ESP_PD_OPTION_OFF);
+  esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_SLOW_MEM, ESP_PD_OPTION_OFF);
+  esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_FAST_MEM, ESP_PD_OPTION_OFF);
+  
+  // 7. Isolate GPIO pins to prevent current leakage
+  gpio_hold_en(GPIO_NUM_2);   // LED pin
+  gpio_hold_en(GPIO_NUM_42);  // Power pin
+  gpio_deep_sleep_hold_en();
+  
+  // 8. Set wakeup timer
+  uint64_t sleepDurationUs = sleepMinutes * 60 * 1000000ULL;
+  esp_sleep_enable_timer_wakeup(sleepDurationUs);
+  
+  logMessage(LOG_INFO, "💤 Entering deep sleep for " + String(sleepMinutes) + " minutes");
+  SerialMon.flush();
+  
+  // 9. Enter deep sleep
+  esp_deep_sleep_start();
 }
 
 void setup() {
@@ -1718,13 +1709,7 @@ void setup() {
   logMessage(LOG_INFO, "\n==== PHASE 4: SLEEP MANAGEMENT ====");
   setStatusLED(false);
   
-  uint64_t sleepDurationUs = config.sleepDurationMinutes * 60 * 1000000ULL;
-  
-  logMessage(LOG_INFO, "💤 Entering deep sleep for " + String(config.sleepDurationMinutes) + " minutes");
-  SerialMon.flush();
-  
-  esp_sleep_enable_timer_wakeup(sleepDurationUs);
-  esp_deep_sleep_start();
+  enterDeepSleepSafely(config.sleepDurationMinutes);
 }
 
 void loop() {
